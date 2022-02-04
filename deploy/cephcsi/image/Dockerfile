@@ -44,6 +44,10 @@ ENV GOROOT=${GOROOT} \
     PATH="${GOROOT}/bin:${GOPATH}/bin:${PATH}"
 
 
+RUN FSCRYPTCTL_SRC="/tmp/fscryptctl" && mkdir "${FSCRYPTCTL_SRC}" && \
+    curl -L https://github.com/google/fscryptctl/archive/refs/tags/v1.0.0.tar.gz | tar xzf - -C "${FSCRYPTCTL_SRC}" --strip-components=1 && \
+    ( cd "${FSCRYPTCTL_SRC}" && make fscryptctl )
+
 WORKDIR ${SRC_DIR}
 
 # Copy source directories
@@ -63,8 +67,10 @@ LABEL maintainers="Ceph-CSI Authors" \
     description="Ceph-CSI Plugin"
 
 COPY --from=builder ${SRC_DIR}/_output/cephcsi /usr/local/bin/cephcsi
+COPY --from=builder /tmp/fscryptctl/fscryptctl /usr/local/bin/fscryptctl
 
 # verify that all dynamically linked libraries are available
 RUN [ $(ldd /usr/local/bin/cephcsi | grep -c '=> not found') = '0' ]
+RUN [ $(ldd /usr/local/bin/fscryptctl | grep -c '=> not found') = '0' ]
 
 ENTRYPOINT ["/usr/local/bin/cephcsi"]
