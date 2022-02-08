@@ -54,6 +54,11 @@ type VolumeOptions struct {
 	SubvolumeGroup     string
 	Features           []string
 
+	// Encryption provides access to optional VolumeEncryption functions
+	Encryption *util.VolumeEncryption
+	// Owner is the creator (tenant, Kubernetes Namespace) of the volume
+	Owner string
+
 	// conn is a connection to the Ceph cluster obtained from a ConnPool
 	conn *util.ClusterConnection
 }

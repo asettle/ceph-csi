@@ -18,9 +18,12 @@ package cephfs
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/ceph/ceph-csi/internal/cephfs/core"
@@ -30,10 +33,15 @@ import (
 	csicommon "github.com/ceph/ceph-csi/internal/csi-common"
 	"github.com/ceph/ceph-csi/internal/util"
 	"github.com/ceph/ceph-csi/internal/util/log"
+	"github.com/pkg/xattr"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+)
+
+const (
+	encryptionPassphraseSize = 64
 )
 
 // NodeServer struct of ceph CSI driver with supported methods of CSI
@@ -115,6 +123,11 @@ func (ns *NodeServer) NodeStageVolume(
 			}
 		}
 	}
+	if err = volOptions.MaybeInitKSM(ctx, req.GetVolumeContext(), req.GetSecrets(), stagingTargetPath); err != nil {
+		log.DebugLog(ctx, "cephfs: maybe init failed %s %+v %s", volID, req.GetVolumeContext(), stagingTargetPath)
+		return nil, err
+	}
+
 	defer volOptions.Destroy()
 
 	// Check if the volume is already mounted
@@ -128,7 +141,9 @@ func (ns *NodeServer) NodeStageVolume(
 
 	if isMnt {
 		log.DebugLog(ctx, "cephfs: volume %s is already mounted to %s, skipping", volID, stagingTargetPath)
-
+		if err = ns.MaybeFscryptUnlock(ctx, volOptions, stagingTargetPath, volID); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
@@ -137,9 +152,106 @@ func (ns *NodeServer) NodeStageVolume(
 		return nil, err
 	}
 
+	if err = ns.MaybeFscryptUnlock(ctx, volOptions, stagingTargetPath, volID); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
 	log.DebugLog(ctx, "cephfs: successfully mounted volume %s to %s", volID, stagingTargetPath)
 
+	if volOptions.IsEncrypted() {
+		if err = ns.CheckFscryptUnlocked(ctx, stagingTargetPath); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	}
 	return &csi.NodeStageVolumeResponse{}, nil
+}
+
+func (*NodeServer) MaybeFscryptUnlock(ctx context.Context, volOptions *core.VolumeOptions, stagingTargetPath string, volID fsutil.VolumeID) error {
+	if !volOptions.IsEncrypted() {
+		return nil
+	}
+
+	// does volume root have a policy and key set?
+	out, err := exec.Command("fscryptctl", "get_policy", stagingTargetPath).CombinedOutput()
+	if err != nil { // no -> initialize, set key
+		log.ErrorLog(ctx, "cephfs: Setting new fscrypt policy and key")
+
+		if err := volOptions.Encryption.StoreNewCryptoPassphrase(string(volID), encryptionPassphraseSize); err != nil {
+			log.ErrorLog(ctx, "Failed to store encryption passphrase for "+
+				"image %s: %s", volOptions, err)
+
+		}
+		passphraseb64, err := volOptions.Encryption.GetCryptoPassphrase(string(volID))
+		if err != nil {
+			log.ErrorLog(ctx, "failed to get passphrase for encrypted device %s: %v",
+				volOptions, err)
+			return err
+		}
+		passphrase, err := base64.URLEncoding.DecodeString(passphraseb64)
+		if err != nil {
+			log.ErrorLog(ctx, "failed to decode base64-encoded passphrase: %s", err)
+			return err
+		}
+
+		cmd := exec.Command("fscryptctl", "add_key", stagingTargetPath)
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			log.ErrorLog(ctx, "failed to add key to mount %s: %v", stagingTargetPath, err)
+			return err
+		}
+		io.WriteString(stdin, string(passphrase))
+		stdin.Close()
+
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			log.ErrorLog(ctx, "failed to add key to mount %s: %v", stagingTargetPath, err)
+			return err
+		}
+		key_id := strings.TrimSpace(string(out))
+		log.ErrorLog(ctx, "11 %v", key_id)
+
+		out, err = exec.Command("fscryptctl", "set_policy", string(key_id), stagingTargetPath).CombinedOutput()
+		if err != nil {
+			log.ErrorLog(ctx, "failed to set policy with key id %s on %s: %v", string(key_id), stagingTargetPath, err)
+			return err
+		}
+		log.DebugLog(ctx, "cephfs: fscrypt unlocked: %s", string(out))
+	} else { // yes -> unlock with exiting key
+		log.ErrorLog(ctx, "cephfs: Unlocking with policy %s", out)
+		passphrase, err := volOptions.Encryption.GetCryptoPassphrase(string(volID))
+		if err != nil {
+			log.ErrorLog(ctx, "failed to get passphrase for encrypted device %s: %v",
+				volOptions, err)
+			return err
+		}
+
+		cmd := exec.Command("fscryptctl", "add_key")
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			log.ErrorLog(ctx, "failed to add key: %v", err)
+			return err
+		}
+		io.WriteString(stdin, passphrase)
+		stdin.Close()
+
+		if err = cmd.Run(); err != nil {
+			log.ErrorLog(ctx, "failed to add key: %v", err)
+			return err
+		}
+		log.DebugLog(ctx, "cephfs: fscrypt unlocked")
+	}
+	return nil
+}
+
+func (*NodeServer) CheckFscryptUnlocked(ctx context.Context, stagingTargetPath string) error {
+	if err := exec.Command("fscryptctl", "get_policy", stagingTargetPath).Run(); err != nil {
+		return errors.New("No policy set")
+	}
+
+	if _, err := xattr.Get(stagingTargetPath, "ceph.fscrypt.auth"); err != nil {
+		return errors.New("No ceph.fscrypt.auth xattr")
+	}
+	return nil
 }
 
 func (*NodeServer) mount(ctx context.Context, volOptions *core.VolumeOptions, req *csi.NodeStageVolumeRequest) error {

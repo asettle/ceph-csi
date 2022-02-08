@@ -28,8 +28,10 @@ import (
 	"github.com/ceph/ceph-csi/internal/util"
 	"github.com/ceph/ceph-csi/internal/util/log"
 
+	kmsapi "github.com/ceph/ceph-csi/internal/kms"
 	fsAdmin "github.com/ceph/go-ceph/cephfs/admin"
 	"github.com/ceph/go-ceph/rados"
+	"github.com/pkg/xattr"
 )
 
 // clusterAdditionalInfo contains information regarding if resize is
@@ -291,4 +293,66 @@ func checkSubvolumeHasFeature(feature string, subVolFeatures []string) bool {
 	}
 
 	return false
+}
+
+type xattrDEKStore struct {
+	directory string
+}
+
+func (x xattrDEKStore) StoreDEK(volumeID string, dek string) error {
+	err := xattr.Set(x.directory, "user.ceph-csi.dek", []byte(dek))
+	return err
+}
+
+func (x xattrDEKStore) FetchDEK(volumeID string) (string, error) {
+	dek, error := xattr.Get(x.directory, "user.ceph-csi.dek")
+	return string(dek), error
+}
+
+func (x xattrDEKStore) RemoveDEK(volumeID string) error {
+	return xattr.Remove(x.directory, "user.ceph-csi.dek")
+}
+
+func (vo *VolumeOptions) MaybeInitKSM(ctx context.Context, volOptions, credentials map[string]string, mountPoint string) error {
+	var (
+		err              error
+		ok               bool
+		encrypted, kmsID string
+	)
+
+	// encryption enabled?
+	encrypted, ok = volOptions["encrypted"]
+	if !ok {
+		return nil
+	}
+
+	kmsID, err = util.FetchEncryptionKMSID(encrypted, volOptions["encryptionKMSID"])
+	if err != nil {
+		log.ErrorLog(ctx, "fetch encryption kmsid failed %+v: %v", volOptions, err)
+		return err
+	}
+
+	vo.Owner, ok = volOptions["csi.storage.k8s.io/pvc/namespace"]
+	if !ok {
+		log.DebugLog(ctx, "could not detect owner for %s", vo)
+	}
+
+	kms, err := kmsapi.GetKMS(vo.Owner, kmsID, credentials)
+	if err != nil {
+		log.ErrorLog(ctx, "get KMS failed %+v: %v", vo, err)
+		return err
+	}
+
+	vo.Encryption, err = util.NewVolumeEncryption(kmsID, kms)
+
+	// if the KMS can not store the DEK itself, we'll store it in the
+	// metadata of the RBD image itself
+	if errors.Is(err, util.ErrDEKStoreNeeded) {
+		vo.Encryption.SetDEKStore(xattrDEKStore{directory: mountPoint})
+	}
+	return nil
+}
+
+func (vo *VolumeOptions) IsEncrypted() bool {
+	return vo.Encryption != nil
 }
